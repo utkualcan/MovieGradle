@@ -1,0 +1,58 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.4.4' // pom.xml'deki sürüm kullanıldı
+    id 'io.spring.dependency-management' version '1.1.7' // Sağlanan sürüm kullanıldı
+}
+
+group = 'org.kurgu' // pom.xml'den alındı
+version = '0.0.1-SNAPSHOT' // pom.xml'den alındı
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17) // pom.xml'den alındı
+    }
+}
+
+configurations {
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+}
+
+repositories {
+    mavenCentral() // pom.xml'den çıkarıldı
+}
+
+dependencies {
+    // pom.xml'den alınan bağımlılıklar
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.5.0' // pom.xml'den eklendi
+    // JAXB API bağımlılığı
+    implementation 'jakarta.xml.bind:jakarta.xml.bind-api:4.0.0' // Veya uygun güncel sürüm
+
+    // JAXB Runtime bağımlılığı (genellikle GlassFish implementation kullanılır)
+    runtimeOnly 'org.glassfish.jaxb:jaxb-runtime:4.0.2' // Veya uygun güncel sürüm
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok' // Hem compileOnly hem de annotationProcessor olarak eklenmesi önerilir
+
+    runtimeOnly 'org.postgresql:postgresql'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    // testRuntimeOnly 'org.junit.platform:junit-platform-launcher' // spring-boot-starter-test bunu zaten içerir
+}
+
+tasks.named('test') {
+    useJUnitPlatform() // pom.xml'deki test yapılandırmasına karşılık gelir
+}
+
+// pom.xml'deki Spring Boot Maven Plugin yapılandırmasına karşılık gelir
+tasks.named('bootJar') {
+    excludes = ['org.projectlombok:lombok']
+}
+
+// İsteğe bağlı: Eğer JAR dosyası oluşturulurken Lombok'un exclude edilmesi gerekiyorsa
+//tasks.named('jar') {
+//    enabled = false // Genellikle bootJar yeterlidir
+//}
