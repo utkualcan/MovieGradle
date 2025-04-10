@@ -11,7 +11,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.utku.moviegradle.DTOs.ClassificationRequestDTO;
@@ -22,6 +21,7 @@ import org.utku.moviegradle.Models.Movie;
 import org.utku.moviegradle.Repositories.CategoryRepository;
 import org.utku.moviegradle.Repositories.ClassificationRepository;
 import org.utku.moviegradle.Repositories.MovieRepository;
+import org.springframework.transaction.annotation.Transactional; // Gerekirse eklenebilir, ama create genellikle tek işlem
 
 import java.time.LocalDate;
 import java.util.ArrayList;
@@ -76,7 +76,6 @@ public class ClassificationController {
                         log.debug("DTO created: {}", dto);
                     } catch (Exception e) {
                         log.error("Error creating DTO for Classification ID {}: {}", c.getClassificationId(), e.getMessage(), e);
-                        // Optionally skip this DTO or handle differently
                     }
                 } else {
                     log.warn("!!! Missing relation for Classification ID {}! Movie found: {}, Category found: {}",
@@ -106,6 +105,7 @@ public class ClassificationController {
             @PathVariable int id) {
         log.info("==> GET /api/v1/classifications/{} called.", id);
         try {
+            // Sadece aktif olanı getirmesi mantıklı
             Optional<Classification> classificationOpt = classificationRepository.findActiveById(id);
 
             if (classificationOpt.isPresent()) {
@@ -122,6 +122,7 @@ public class ClassificationController {
                 } else {
                     log.error("!!! Missing relation for Classification ID {}! Movie found: {}, Category found: {}",
                             c.getClassificationId(), movieOpt.isPresent(), categoryOpt.isPresent());
+                    // Bu durum veri tutarsızlığına işaret eder, 500 dönmek uygun olabilir.
                     return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                             .body("Classification found, but related movie or category is missing.");
                 }
@@ -137,13 +138,15 @@ public class ClassificationController {
     }
 
     @PostMapping
-    @Operation(summary = "Create a new classification", description = "Links a movie to a category. Ensures the combination is unique among active classifications.")
+    @Operation(summary = "Create or reactivate a classification", description = "Links a movie to a category. If an active link exists, returns conflict. If a soft-deleted link exists, it reactivates it. Otherwise, creates a new link.")
     @ApiResponses(value = {
-            @ApiResponse(responseCode = "201", description = "Classification created successfully",
+            @ApiResponse(responseCode = "200", description = "Classification reactivated successfully", // Reactivate için 200 OK
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ClassificationResponseDTO.class))),
+            @ApiResponse(responseCode = "201", description = "Classification created successfully", // Yeni için 201 Created
                     content = @Content(mediaType = "application/json", schema = @Schema(implementation = ClassificationResponseDTO.class))),
             @ApiResponse(responseCode = "400", description = "Invalid input: Movie ID or Category ID is invalid or missing", content = @Content),
             @ApiResponse(responseCode = "409", description = "Conflict: This movie is already actively classified under this category", content = @Content),
-            @ApiResponse(responseCode = "500", description = "Internal server error during classification creation", content = @Content)
+            @ApiResponse(responseCode = "500", description = "Internal server error during classification creation/reactivation", content = @Content)
     })
     public ResponseEntity<?> createClassification(
             @io.swagger.v3.oas.annotations.parameters.RequestBody(description = "Object containing movieId and categoryId to link.", required = true,
@@ -156,6 +159,7 @@ public class ClassificationController {
                 return ResponseEntity.badRequest().body("Movie ID and Category ID must be positive integers.");
             }
 
+            // İlişkili Movie ve Category var mı kontrol et (Hata mesajını iyileştirmek için)
             Optional<Movie> movieOpt = movieRepository.findById(requestDTO.getMovieId());
             Optional<Category> categoryOpt = categoryRepository.findById(requestDTO.getCategoryId());
 
@@ -169,63 +173,86 @@ public class ClassificationController {
             }
             log.info("Movie and Category IDs are valid.");
 
-            Optional<Classification> existing = classificationRepository.findByMovieIdAndCategoryIdAndIsdeletedFalse(
+            // 1. Aktif kayıt var mı kontrol et
+            Optional<Classification> existingActive = classificationRepository.findByMovieIdAndCategoryIdAndIsdeletedFalse(
                     requestDTO.getMovieId(), requestDTO.getCategoryId());
 
-            if (existing.isPresent()) {
+            if (existingActive.isPresent()) {
                 log.warn("!!! Conflict: Movie ID {} already actively classified under Category ID {} (Active Classification ID: {}).",
-                        requestDTO.getMovieId(), requestDTO.getCategoryId(), existing.get().getClassificationId());
+                        requestDTO.getMovieId(), requestDTO.getCategoryId(), existingActive.get().getClassificationId());
+                // Aktif kayıt varsa CONFLICT dön
                 return ResponseEntity.status(HttpStatus.CONFLICT)
                         .body("This movie is already actively assigned to this category.");
             }
-            log.info("No active conflict found, proceeding to create new classification.");
 
-            Classification newClassification = new Classification();
-            newClassification.setMovieId(requestDTO.getMovieId());
-            newClassification.setCategoryId(requestDTO.getCategoryId());
-            newClassification.setDate(LocalDate.now());
-            newClassification.setIsdeleted(false);
+            // 2. Aktif kayıt yoksa, soft-delete edilmiş kayıt var mı kontrol et
+            Optional<Classification> existingSoftDeleted = classificationRepository.findByMovieIdAndCategoryIdAndIsdeletedTrue(
+                    requestDTO.getMovieId(), requestDTO.getCategoryId());
 
-            Classification savedClassification = classificationRepository.save(newClassification);
-            log.info("New classification saved with ID: {}", savedClassification.getClassificationId());
+            Classification resultingClassification;
+            HttpStatus responseStatus;
 
+            if (existingSoftDeleted.isPresent()) {
+                // 3. Soft-delete edilmiş kayıt varsa, onu aktive et
+                log.info("Found soft-deleted classification (ID: {}). Reactivating...", existingSoftDeleted.get().getClassificationId());
+                Classification toReactivate = existingSoftDeleted.get();
+                toReactivate.setIsdeleted(false);
+                toReactivate.setDate(LocalDate.now()); // Tarihi güncelle (opsiyonel ama mantıklı)
+                resultingClassification = classificationRepository.save(toReactivate);
+                responseStatus = HttpStatus.OK; // Var olanı güncellediğimiz/aktive ettiğimiz için 200 OK
+                log.info("Classification reactivated successfully with ID: {}", resultingClassification.getClassificationId());
+            } else {
+                // 4. Ne aktif ne de soft-deleted kayıt yoksa, yeni kayıt oluştur
+                log.info("No existing classification found (active or soft-deleted). Creating new one.");
+                Classification newClassification = new Classification();
+                newClassification.setMovieId(requestDTO.getMovieId());
+                newClassification.setCategoryId(requestDTO.getCategoryId());
+                newClassification.setDate(LocalDate.now());
+                newClassification.setIsdeleted(false); // Yeni kayıt aktif başlar
+                resultingClassification = classificationRepository.save(newClassification);
+                responseStatus = HttpStatus.CREATED; // Yeni oluşturulduğu için 201 Created
+                log.info("New classification created successfully with ID: {}", resultingClassification.getClassificationId());
+            }
+
+            // DTO oluştur ve döndür
             ClassificationResponseDTO response = ClassificationResponseDTO.fromEntities(
-                    savedClassification, movieOpt.get(), categoryOpt.get());
-            log.info("<== Returning created DTO: {}", response);
+                    resultingClassification, movieOpt.get(), categoryOpt.get());
+            log.info("<== Returning classification DTO: {}", response);
 
-            return ResponseEntity.status(HttpStatus.CREATED).body(response);
+            return ResponseEntity.status(responseStatus).body(response); // Durum kodunu dinamik olarak ayarla
 
         } catch (Exception e) {
             log.error("!!! General error in createClassification: {}", e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body("Error creating classification: " + e.getMessage());
+                    .body("Error creating/reactivating classification: " + e.getMessage());
         }
     }
 
+
     @PutMapping("/{id}")
-    @Operation(summary = "Update an existing classification", description = "Updates the movie and category link for a given classification ID. Ensures the new combination doesn't conflict with other active classifications.")
+    @Operation(summary = "Update an existing active classification", description = "Updates the movie and category link for a given active classification ID. Ensures the new combination doesn't conflict with other active classifications.")
     @ApiResponses(value = {
             @ApiResponse(responseCode = "200", description = "Classification updated successfully",
                     content = @Content(mediaType = "application/json", schema = @Schema(implementation = ClassificationResponseDTO.class))),
             @ApiResponse(responseCode = "400", description = "Invalid input: Movie ID or Category ID is invalid or missing", content = @Content),
-            @ApiResponse(responseCode = "404", description = "Active classification not found with the given ID", content = @Content),
+            @ApiResponse(responseCode = "404", description = "Active classification not found with the given ID to update", content = @Content),
             @ApiResponse(responseCode = "409", description = "Conflict: The target movie/category combination already exists in another active classification", content = @Content),
             @ApiResponse(responseCode = "500", description = "Internal server error during classification update", content = @Content)
     })
     public ResponseEntity<?> updateClassification(
-            @Parameter(description = "ID of the classification to update", required = true)
+            @Parameter(description = "ID of the active classification to update", required = true)
             @PathVariable int id,
             @io.swagger.v3.oas.annotations.parameters.RequestBody(description = "Object containing the new movieId and categoryId.", required = true,
                     content = @Content(schema = @Schema(implementation = ClassificationRequestDTO.class)))
             @RequestBody ClassificationRequestDTO requestDTO) {
         log.info("==> PUT /api/v1/classifications/{} called. RequestBody: {}", id, requestDTO);
         try{
-
             if (requestDTO.getMovieId() <= 0 || requestDTO.getCategoryId() <= 0) {
                 log.warn("!!! Invalid (zero or negative) Movie or Category ID received for update.");
                 return ResponseEntity.badRequest().body("Movie ID and Category ID must be positive integers.");
             }
 
+            // Sadece aktif olanı güncellemek mantıklı
             Optional<Classification> classificationOpt = classificationRepository.findActiveById(id);
 
             if (classificationOpt.isEmpty()) {
@@ -233,6 +260,7 @@ public class ClassificationController {
                 return ResponseEntity.notFound().build();
             }
 
+            // Yeni atanacak Movie ve Category var mı kontrol et
             Optional<Movie> movieOpt = movieRepository.findById(requestDTO.getMovieId());
             Optional<Category> categoryOpt = categoryRepository.findById(requestDTO.getCategoryId());
             if (movieOpt.isEmpty()) {
@@ -244,6 +272,7 @@ public class ClassificationController {
                 return ResponseEntity.badRequest().body("Invalid Category ID provided for update.");
             }
 
+            // Güncellenmek istenen (movie, category) çifti, güncellenen ID DIŞINDA başka bir aktif kayıtta var mı?
             Optional<Classification> existingConflict = classificationRepository.findByMovieIdAndCategoryIdAndIsdeletedFalse(
                     requestDTO.getMovieId(), requestDTO.getCategoryId());
             if(existingConflict.isPresent() && existingConflict.get().getClassificationId() != id) {
@@ -253,9 +282,14 @@ public class ClassificationController {
                         .body("The target movie/category combination is already assigned in another active classification.");
             }
 
+            // Soft-delete edilmiş aynı çift var mı diye kontrol etmeye gerek yok, çünkü bu ID'yi güncelliyoruz.
+            // Eğer bu ID'deki kaydı (M1, C1)'den (M2, C2)'ye güncellerken, (M2, C2) çifti soft-deleted ise,
+            // bu güncellemeye izin vermek genellikle beklenen davranıştır. Çakışma sadece AKTİF kayıtlarla olur.
+
             Classification existingClassification = classificationOpt.get();
             existingClassification.setMovieId(requestDTO.getMovieId());
             existingClassification.setCategoryId(requestDTO.getCategoryId());
+            existingClassification.setDate(LocalDate.now()); // Güncelleme tarihini de set edelim
 
             Classification updatedClassification = classificationRepository.save(existingClassification);
             log.info("Classification updated successfully for ID: {}", updatedClassification.getClassificationId());
@@ -272,33 +306,39 @@ public class ClassificationController {
         }
     }
 
+
     @DeleteMapping("/{id}")
-    @Operation(summary = "Delete a classification (Soft Delete)", description = "Marks the classification with the given ID as deleted.")
+    @Operation(summary = "Delete a classification (Soft Delete)", description = "Marks the active classification with the given ID as deleted.")
     @ApiResponses(value = {
             @ApiResponse(responseCode = "204", description = "Classification marked as deleted successfully", content = @Content),
-            @ApiResponse(responseCode = "404", description = "Classification not found with the given ID", content = @Content),
+            @ApiResponse(responseCode = "404", description = "Active classification not found with the given ID to delete", content = @Content),
             @ApiResponse(responseCode = "500", description = "Internal server error during classification deletion", content = @Content)
     })
     public ResponseEntity<Void> deleteClassification(
-            @Parameter(description = "ID of the classification to delete (soft delete)", required = true)
+            @Parameter(description = "ID of the active classification to delete (soft delete)", required = true)
             @PathVariable int id) {
         log.info("==> DELETE /api/v1/classifications/{} called (soft delete).", id);
         try {
-            Optional<Classification> optionalClassification = classificationRepository.findById(id);
+            // Sadece aktif olanı silmek mantıklı. Zaten silinmiş olanı tekrar silmeye çalışmak gereksiz.
+            Optional<Classification> optionalClassification = classificationRepository.findActiveById(id);
 
             if (optionalClassification.isPresent()) {
                 Classification classification = optionalClassification.get();
-                if (classification.isIsdeleted()) {
-                    log.info("Classification ID {} was already deleted.", id);
-                    return ResponseEntity.noContent().build();
-                }
                 classification.setIsdeleted(true);
+                // Tarihi de null yapabilir veya silinme tarihi tutulabilir, şimdilik sadece flag'i değiştiriyoruz.
                 classificationRepository.save(classification);
                 log.info("Classification ID {} marked as deleted (soft delete).", id);
-                return ResponseEntity.noContent().build();
+                return ResponseEntity.noContent().build(); // Başarılı soft delete
             } else {
-                log.warn("!!! Delete failed. Classification not found with ID: {}", id);
-                return ResponseEntity.notFound().build();
+                // Aktif kayıt bulunamadı.
+                log.warn("!!! Soft Delete failed. Active classification not found with ID: {}", id);
+                // İsteğe bağlı: Zaten silinmiş mi diye kontrol edip 204 dönülebilir, ama 404 daha net.
+                // Optional<Classification> alreadyDeleted = classificationRepository.findById(id);
+                // if (alreadyDeleted.isPresent() && alreadyDeleted.get().isIsdeleted()) {
+                //    log.info("Classification ID {} was already soft-deleted.", id);
+                //    return ResponseEntity.noContent().build();
+                // }
+                return ResponseEntity.notFound().build(); // Aktif kayıt bulunamadığı için 404
             }
         } catch (Exception e) {
             log.error("!!! General error in deleteClassification (ID: {}): {}", id, e.getMessage(), e);

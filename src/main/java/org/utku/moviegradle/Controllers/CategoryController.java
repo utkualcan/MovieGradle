@@ -16,7 +16,8 @@ import org.slf4j.LoggerFactory;
 import org.utku.moviegradle.Models.Category;
 import org.utku.moviegradle.Repositories.CategoryRepository;
 import org.utku.moviegradle.Repositories.ClassificationRepository;
-
+import org.utku.moviegradle.Models.Classification;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.Optional;
@@ -36,6 +37,8 @@ public class CategoryController {
         this.categoryRepository = categoryRepository;
         this.classificationRepository = classificationRepository;
     }
+
+    // GET, POST, PUT metotları aynı kalır...
 
     @GetMapping
     @Operation(summary = "Get all categories", description = "Returns a list of all movie categories.")
@@ -81,7 +84,7 @@ public class CategoryController {
         try {
             if (category.getName() == null || category.getName().trim().isEmpty()) {
                 log.warn("Attempted to create category with empty name.");
-                return ResponseEntity.badRequest().build();
+                return ResponseEntity.badRequest().body(null);
             }
             category.setCategory_id(0);
             Category savedCategory = categoryRepository.save(category);
@@ -113,7 +116,7 @@ public class CategoryController {
             Category existingCategory = optionalCategory.get();
             if (categoryDetails.getName() == null || categoryDetails.getName().trim().isEmpty()) {
                 log.warn("Attempted to update category ID {} with empty name.", id);
-                return ResponseEntity.badRequest().build();
+                return ResponseEntity.badRequest().body(null);
             }
             existingCategory.setName(categoryDetails.getName());
             Category updatedCategory = categoryRepository.save(existingCategory);
@@ -125,35 +128,51 @@ public class CategoryController {
         }
     }
 
+    // --- DELETE Metodu Güncellendi ---
+    @Transactional // Birden fazla DB işlemi olduğu için transactional kalmalı
     @DeleteMapping("/{id}")
-    @Operation(summary = "Delete a category", description = "Deletes the category with the given ID.")
+    @Operation(summary = "Delete a category and all its classifications", description = "Deletes the category with the given ID and *permanently deletes all* associated classifications (active or not).")
     @ApiResponses(value = {
-            @ApiResponse(responseCode = "204", description = "Category deleted successfully", content = @Content),
+            @ApiResponse(responseCode = "204", description = "Category and associated classifications deleted successfully", content = @Content),
             @ApiResponse(responseCode = "404", description = "Category not found with the given ID", content = @Content),
-            @ApiResponse(responseCode = "409", description = "Conflict, category cannot be deleted (e.g., due to existing classifications)", content = @Content)
+            @ApiResponse(responseCode = "500", description = "Internal server error during deletion", content = @Content)
+            // 409 Conflict artık bu senaryoda dönülmeyecek (aktif bağlantı kontrolü kaldırıldı)
     })
     public ResponseEntity<Void> deleteCategory(
             @Parameter(description = "ID of the category to delete", required = true)
             @PathVariable int id) {
-        log.info("DELETE /api/v1/categories/{} called", id);
-        if (categoryRepository.existsById(id)) {
-            try {
-                boolean hasClassifications = classificationRepository.existsByCategoryId(id);
-                if (hasClassifications) {
-                    log.warn("Conflict deleting category ID {}: It has existing classifications.", id);
-                    return ResponseEntity.status(HttpStatus.CONFLICT).build();
-                }
+        log.info("DELETE /api/v1/categories/{} called (Cascade Delete for Classifications)", id);
 
-                categoryRepository.deleteById(id);
-                log.info("Category deleted successfully with ID: {}", id);
-                return ResponseEntity.noContent().build();
-            } catch (Exception e) {
-                log.error("Error deleting category ID {}: {}", id, e.getMessage(), e);
-                return ResponseEntity.status(HttpStatus.CONFLICT).build();
-            }
-        } else {
+        // 1. Kategori var mı kontrol et
+        if (!categoryRepository.existsById(id)) {
             log.warn("Delete failed. Category not found with ID: {}", id);
             return ResponseEntity.notFound().build();
+        }
+
+        // 2. Aktif classification kontrolü KALDIRILDI.
+
+        try {
+            // 3. Kategoriye bağlı TÜM classification'ları bul (aktif/pasif farketmez)
+            List<Classification> associatedClassifications = classificationRepository.findByCategoryId(id);
+
+            if (!associatedClassifications.isEmpty()) {
+                log.info("Found {} classifications associated with category ID {}. Deleting them (HARD DELETE)...", associatedClassifications.size(), id);
+                // 4. Bulunan TÜM classification'ları HARD DELETE et
+                classificationRepository.deleteAllInBatch(associatedClassifications);
+                log.info("Associated classifications deleted successfully.");
+            } else {
+                log.info("No classifications found associated with category ID {}.", id);
+            }
+
+            // 5. Kategoriyi sil
+            categoryRepository.deleteById(id);
+            log.info("Category deleted successfully with ID: {}", id);
+            return ResponseEntity.noContent().build(); // Başarılı
+
+        } catch (Exception e) {
+            // Beklenmedik bir hata olursa (örn. DB bağlantı sorunu)
+            log.error("Error during deletion process for category ID {}: {}", id, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build(); // 500 Internal Server Error
         }
     }
 }
